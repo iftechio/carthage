@@ -772,7 +772,7 @@ private func build(sdk: SDK, with buildArgs: BuildArguments, in workingDirectory
 			//
 			// See https://github.com/Carthage/Carthage/issues/2056
 			// and https://developer.apple.com/library/content/qa/qa1964/_index.html.
-			let xcodebuildAction: BuildArguments.Action = sdk.isDevice ? .archive : .build
+			let xcodebuildAction: BuildArguments.Action = .build
 			return BuildSettings.load(with: argsForLoading, for: xcodebuildAction)
 				.filter { settings in
 					// Only copy build products that are frameworks
