@@ -8,7 +8,7 @@ class Jikecarthage < Formula
   bottle do
     cellar :any
     root_url "https://github.com/ruguoapp/homebrew-carthage/releases/download/0.32.0/"
-    sha256 "0831024b01d3de78e52c859abf43871d4ee03edbf6984cc9035b3d98547c2267" => :mojave
+    sha256 "9c3671054b7db0f6e3b95b00956666bef47dd3930f05be9e57b6208732502efe" => :mojave
   end
 
   depends_on :xcode => ["9.4", :build]
