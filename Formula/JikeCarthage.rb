@@ -1,7 +1,7 @@
 class Jikecarthage < Formula
     desc "Decentralized dependency manager for Cocoa"
     homepage "https://github.com/Carthage/Carthage"
-    url "https://github.com/ruguoapp/homebrew-carthage.git"
+    url ".../carthage.tar.gz", :using => GitHubPrivateRepositoryReleaseDownloadStrategy
     head "https://github.com/ruguoapp/homebrew-carthage.git", :shallow => false
   
     bottle do
