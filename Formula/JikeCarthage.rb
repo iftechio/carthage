@@ -1,7 +1,7 @@
 # Documentation: https://docs.brew.sh/Formula-Cookbook
 #                https://www.rubydoc.info/github/Homebrew/brew/master/Formula
 # PLEASE REMOVE ALL GENERATED COMMENTS BEFORE SUBMITTING YOUR PULL REQUEST!
-class JikeCarthage < Formula
+class Jikecarthage < Formula
   desc "A simple, decentralized dependency manager for Cocoa"
   homepage ""
   url "https://github.com/ruguoapp/homebrew-carthage/releases/download/0.32.0/carthage.tar.gz"
