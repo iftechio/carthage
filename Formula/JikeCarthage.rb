@@ -7,7 +7,7 @@ class Jikecarthage < Formula
 
   bottle do
     cellar :any
-    root_url "https://github.com/ruguoapp/homebrew-carthage/releases/download/0.32.0/"
+    root_url "https://github.com/ruguoapp/homebrew-carthage/releases/download/0.32.0"
     sha256 "9c3671054b7db0f6e3b95b00956666bef47dd3930f05be9e57b6208732502efe" => :mojave
   end
 
