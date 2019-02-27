@@ -5,6 +5,11 @@ class Jikecarthage < Formula
     head "https://github.com/ruguoapp/homebrew-carthage.git", :shallow => false
     
     depends_on :xcode => ["9.4", :build]
+
+    bottle do
+      cellar :any
+      sha256 "0831024b01d3de78e52c859abf43871d4ee03edbf6984cc9035b3d98547c2267" => :mojave
+    end
   
     def install
       system "make", "prefix_install", "PREFIX=#{prefix}"
