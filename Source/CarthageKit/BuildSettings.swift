@@ -43,7 +43,8 @@ public struct BuildSettings {
 	///
 	/// Upon .success, sends one BuildSettings value for each target included in
 	/// the referenced scheme.
-	public static func load(with arguments: BuildArguments, for action: BuildArguments.Action? = nil) -> SignalProducer<BuildSettings, CarthageError> {
+	public static func load(with arguments: BuildArguments,
+		for action: BuildArguments.Action? = nil) -> SignalProducer<BuildSettings, CarthageError> {
 		// xcodebuild (in Xcode 8.0) has a bug where xcodebuild -showBuildSettings
 		// can hang indefinitely on projects that contain core data models.
 		// rdar://27052195
@@ -241,6 +242,17 @@ public struct BuildSettings {
 		return self["WRAPPER_NAME"]
 	}
 
+	/// Attempts to determine the name of the built product's wrapper bundle replacing "framework" with "xcframework".
+	public var xcFrameworkWrapperName: Result<String, CarthageError> {
+		return self["WRAPPER_NAME"].flatMap { name in
+			let substrings = name.split(separator: ".")
+			guard let replacementString = substrings.last?.replacingOccurrences(of: "framework", with: "xcframework") else {
+				return .failure(.internalError(description: "WRAPPER_NAME does not containt .framework extension"))
+			}
+			return .success(substrings.dropLast().joined(separator: ".").appending("." + replacementString))
+		}
+	}
+
 	/// Attempts to determine the URL to the built product's wrapper, corresponding
 	/// to its xcodebuild action.
 	public var wrapperURL: Result<URL, CarthageError> {
@@ -290,6 +302,11 @@ public struct BuildSettings {
 	/// Attempts to determine target build directory
 	public var targetBuildDirectory: Result<String, CarthageError> {
 		return self["TARGET_BUILD_DIR"]
+	}
+
+	public var shouldBuildForDistribution: Result<Bool, CarthageError> {
+		return self["BUILD_LIBRARY_FOR_DISTRIBUTION"]
+			.map { $0 == "YES" }
 	}
 
 	/// Add subdirectory path if it's not possible to paste product to destination path

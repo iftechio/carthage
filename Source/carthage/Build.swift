@@ -23,6 +23,7 @@ extension BuildOptions: OptionsProtocol {
 			<*> mode <| Option<String?>(key: "derived-data", defaultValue: nil, usage: "path to the custom derived data folder")
 			<*> mode <| Option(key: "cache-builds", defaultValue: false, usage: "use cached builds when possible")
 			<*> mode <| Option(key: "use-binaries", defaultValue: true, usage: "don't use downloaded binaries when possible")
+			<*> mode <| Option(key: "create-xcframework", defaultValue: false, usage: "create an .xcframework instead of a fat binary")
 	}
 }
 
@@ -44,7 +45,11 @@ public struct BuildCommand: CommandProtocol {
 		/// Otherwise, this producer will be empty.
 		public var archiveProducer: SignalProducer<(), CarthageError> {
 			if archive {
-				let options = ArchiveCommand.Options(outputPath: nil, directoryPath: directoryPath, colorOptions: colorOptions, frameworkNames: [])
+				let options = ArchiveCommand.Options(outputPath: nil,
+													 directoryPath: directoryPath,
+													 colorOptions: colorOptions,
+													 createXCFramework: buildOptions.useXCFrameworks,
+													 frameworkNames: [])
 				return ArchiveCommand().archiveWithOptions(options)
 			} else {
 				return .empty

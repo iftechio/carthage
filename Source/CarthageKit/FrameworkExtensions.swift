@@ -1,6 +1,7 @@
 import Foundation
 import Result
 import ReactiveSwift
+import XCDBLD
 
 extension String {
 	/// Returns a producer that will enumerate each line of the receiver, then
@@ -295,16 +296,52 @@ extension URL {
 
 	/// Returns the first `URL` to match `<self>/Headers/*-Swift.h`. Otherwise `nil`.
 	internal func swiftHeaderURL() -> URL? {
-		let headersURL = self.appendingPathComponent("Headers", isDirectory: true).resolvingSymlinksInPath()
+
+		let xcFrameworkLibraryIdAndPath: (identifier: String, path: String)? = self.xcFrameworkLibraryIdentifiedAndPath()
+		let headersURL = self.appendingPathComponent(xcFrameworkLibraryIdAndPath?.identifier ?? "" )
+			.appendingPathComponent(xcFrameworkLibraryIdAndPath?.path ?? "")
+			.appendingPathComponent("Headers", isDirectory: true)
+			.resolvingSymlinksInPath()
 		let dirContents = try? FileManager.default.contentsOfDirectory(at: headersURL, includingPropertiesForKeys: [], options: [])
 		return dirContents?.first { $0.absoluteString.contains("-Swift.h") }
 	}
 
 	/// Returns the first `URL` to match `<self>/Modules/*.swiftmodule`. Otherwise `nil`.
 	internal func swiftmoduleURL() -> URL? {
-		let headersURL = self.appendingPathComponent("Modules", isDirectory: true).resolvingSymlinksInPath()
-		let dirContents = try? FileManager.default.contentsOfDirectory(at: headersURL, includingPropertiesForKeys: [], options: [])
+
+		let xcFrameworkLibraryIdAndPath: (identifier: String, path: String)? = self.xcFrameworkLibraryIdentifiedAndPath()
+		let modulesURL = self.appendingPathComponent(xcFrameworkLibraryIdAndPath?.identifier ?? "" )
+			.appendingPathComponent(xcFrameworkLibraryIdAndPath?.path ?? "")
+			.appendingPathComponent("Modules", isDirectory: true)
+			.resolvingSymlinksInPath()
+		let dirContents = try? FileManager.default.contentsOfDirectory(at: modulesURL, includingPropertiesForKeys: [], options: [])
 		return dirContents?.first { $0.absoluteString.contains("swiftmodule") }
+	}
+
+	func xcFrameworkLibraryIdentifiedAndPath() -> (String, String)? {
+
+		let libraryIdentifier: String
+		let libraryPath: String
+		if self.pathExtension == "xcframework" {
+			let xcFrameworkInfo = Bundle(url: self)?
+				.infoDictionary
+				.flatMap(XCFrameworkInfo.init)
+
+			guard let firstLibrary = xcFrameworkInfo?
+				.availableLibraries
+				.first else {
+					return nil
+			}
+			libraryIdentifier = firstLibrary
+				.identifier
+			libraryPath = firstLibrary.path
+
+			return (libraryIdentifier, libraryPath)
+
+		}
+		else {
+			return nil
+		}
 	}
 }
 
@@ -415,10 +452,10 @@ extension Reactive where Base: FileManager {
       try self.base.copyItem(at: source, to: destination, avoiding·rdar·32984063: true)
       return SignalProducer(value: destination)
     } catch {
-      return SignalProducer(error: .internalError(description: "copyItem failed: \(error)"))
+      return SignalProducer(error: .internalError(description: "copyItem failed: \(error)\n\(source)\n\(into)"))
     }
   }
-  
+
   public func replaceItem(at originalItemURL: URL, withItemAt newItemURL: URL) -> SignalProducer<(), CarthageError> {
     do {
       guard (try self.base.replaceItemAt(originalItemURL, withItemAt: newItemURL, backupItemName: nil, options: .usingNewMetadataOnly)) != nil else {

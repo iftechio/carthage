@@ -60,9 +60,12 @@ internal func frameworkSwiftVersionIfIsSwiftFramework(_ frameworkURL: URL) -> Si
 
 /// Determines the Swift version of a framework at a given `URL`.
 internal func frameworkSwiftVersion(_ frameworkURL: URL) -> SignalProducer<String, SwiftVersionError> {
+	// Fall back to dSYM version parsing if header is not present
+	guard let swiftHeaderURL = frameworkURL.swiftHeaderURL() else {
+		return dSYMSwiftVersion(frameworkURL.appendingPathExtension("dSYM"))
+	}
 
 	guard
-		let swiftHeaderURL = frameworkURL.swiftHeaderURL(),
 		let data = try? Data(contentsOf: swiftHeaderURL),
 		let contents = String(data: data, encoding: .utf8),
 		let swiftVersion = parseSwiftVersionCommand(output: contents)
@@ -73,8 +76,7 @@ internal func frameworkSwiftVersion(_ frameworkURL: URL) -> SignalProducer<Strin
 	return SignalProducer(value: swiftVersion)
 }
 
-internal func dSYMSwiftVersion(_ dSYMURL: URL) -> SignalProducer<String, SwiftVersionError> {
-
+private func dSYMSwiftVersion(_ dSYMURL: URL) -> SignalProducer<String, SwiftVersionError> {
 	// Pick one architecture
 	guard let arch = architecturesInPackage(dSYMURL).first()?.value else {
 		return SignalProducer(error: .unknownFrameworkSwiftVersion(message: "No architectures found in dSYM."))
@@ -84,7 +86,7 @@ internal func dSYMSwiftVersion(_ dSYMURL: URL) -> SignalProducer<String, SwiftVe
 	let task = Task("/usr/bin/xcrun", arguments: ["dwarfdump", "--arch=\(arch)", "--debug-info", dSYMURL.path])
 
 	//	$ dwarfdump --debug-info Carthage/Build/iOS/Swiftz.framework.dSYM
-	//		----------------------------------------------------------------------
+	//	----------------------------------------------------------------------
 	//	File: Carthage/Build/iOS/Swiftz.framework.dSYM/Contents/Resources/DWARF/Swiftz (i386)
 	//	----------------------------------------------------------------------
 	//	.debug_info contents:
@@ -164,8 +166,9 @@ public func xcodebuildTask(_ task: String, _ buildArguments: BuildArguments) -> 
 public func buildableSchemesInDirectory( // swiftlint:disable:this function_body_length
 	_ directoryURL: URL,
 	withConfiguration configuration: String,
-	forPlatforms platforms: Set<Platform> = []
-) -> SignalProducer<(Scheme, ProjectLocator), CarthageError> {
+	forPlatforms platforms: Set<Platform> = [],
+	useXCFrameworks: Bool = false
+) -> SignalProducer<(Scheme, ProjectLocator, BuildSettings), CarthageError> {
 	precondition(directoryURL.isFileURL)
 	let locator = ProjectLocator
 			.locate(in: directoryURL)
@@ -191,16 +194,25 @@ public func buildableSchemesInDirectory( // swiftlint:disable:this function_body
 		.flatMap(.merge) { (projects: [(ProjectLocator, [Scheme])]) -> SignalProducer<(Scheme, ProjectLocator), CarthageError> in
 			return schemesInProjects(projects).flatten()
 		}
-		.flatMap(.concurrent(limit: 4)) { scheme, project -> SignalProducer<(Scheme, ProjectLocator), CarthageError> in
-			/// Check whether we should the scheme by checking against the project. If we're building
+		.flatMap(.concurrent(limit: 4)) { scheme, project -> SignalProducer<(Scheme, ProjectLocator, BuildSettings), CarthageError> in
+			/// Check whether we should build the scheme by checking against the project. If we're building
 			/// from a workspace, then it might include additional targets that would trigger our
 			/// check.
+
 			let buildArguments = BuildArguments(project: project, scheme: scheme, configuration: configuration)
-			return shouldBuildScheme(buildArguments, platforms)
-				.filter { $0 }
-				.map { _ in (scheme, project) }
+			return BuildSettings.load(with: buildArguments)
+				.flatMap(.concat) { settings in
+
+					return shouldBuild(scheme: scheme,
+									   withSettings: settings,
+									   forPlatforms: platforms,
+									   shouldBuildForDistribution: useXCFrameworks)
+						.filter { $0 }
+						.map { _ in (scheme, project, settings) }
+			}
 		}
-		.flatMap(.concurrent(limit: 4)) { scheme, project -> SignalProducer<(Scheme, ProjectLocator), CarthageError> in
+		.flatMap(.concurrent(limit: 4)) { scheme, project, settings -> SignalProducer<(Scheme, ProjectLocator, BuildSettings), CarthageError> in
+
 			return locator
 				// This scheduler hop is required to avoid disallowed recursive signals.
 				// See https://github.com/ReactiveCocoa/ReactiveCocoa/pull/2042.
@@ -210,10 +222,15 @@ public func buildableSchemesInDirectory( // swiftlint:disable:this function_body
 					switch project {
 					case .workspace where schemes.contains(scheme):
 						let buildArguments = BuildArguments(project: project, scheme: scheme, configuration: configuration)
-						return shouldBuildScheme(buildArguments, platforms)
-							.filter { $0 }
-							.map { _ in project }
-
+						return BuildSettings.load(with: buildArguments)
+							.flatMap(.concat) { settings in
+								return shouldBuild(scheme: scheme,
+												   withSettings: settings,
+												   forPlatforms: platforms,
+												   shouldBuildForDistribution: useXCFrameworks)
+									.filter { $0 }
+									.map { _ in project }
+						}
 					default:
 						return .empty
 					}
@@ -222,10 +239,10 @@ public func buildableSchemesInDirectory( // swiftlint:disable:this function_body
 				// which the scheme is defined instead.
 				.concat(value: project)
 				.take(first: 1)
-				.map { project in (scheme, project) }
+				.map { project in (scheme, project, settings) }
 		}
 		.collect()
-		.flatMap(.merge) { (schemes: [(Scheme, ProjectLocator)]) -> SignalProducer<(Scheme, ProjectLocator), CarthageError> in
+		.flatMap(.merge) { (schemes: [(Scheme, ProjectLocator, BuildSettings)]) -> SignalProducer<(Scheme, ProjectLocator, BuildSettings), CarthageError> in
 			if !schemes.isEmpty {
 				return .init(schemes)
 			} else {
@@ -297,6 +314,9 @@ internal enum PackageType: String {
 
 	/// A .dSYM package.
 	case dSYM = "dSYM"
+
+	/// A .xcframework
+	case xcFramework = "XFWK"
 }
 
 /// Finds the built product for the given settings, then copies it (preserving
@@ -351,6 +371,35 @@ private func mergeExecutables(_ executableURLs: [URL], _ outputURL: URL) -> Sign
 
 			return lipoTask.launch()
 				.mapError(CarthageError.taskError)
+		}
+		.then(SignalProducer<(), CarthageError>.empty)
+}
+
+/// Attempts to create a .xcframework, written to
+/// the specified URL.
+private func createXCFramework(_ frameworkURLs: [URL], _ outputURL: URL) -> SignalProducer<(), CarthageError> {
+	precondition(outputURL.isFileURL)
+
+	return SignalProducer<URL, CarthageError>(frameworkURLs)
+		.attemptMap { url -> Result<String, CarthageError> in
+			if url.isFileURL {
+				return .success(url.resolvingSymlinksInPath().path)
+			} else {
+				return .failure(.parseError(description: "expected file URL to built executable, got \(url)"))
+			}
+		}
+		.collect()
+		.flatMap(.merge) { executablePaths -> SignalProducer<TaskEvent<Data>, CarthageError> in
+			let xcodebuildTask = Task("/usr/bin/xcrun",
+									  arguments: [ "xcodebuild", "-create-xcframework" ]
+										+ executablePaths.flatMap { ["-framework", $0] }
+										+ [ "-output", outputURL.path ]
+			)
+
+			return xcodebuildTask.launch()
+				.mapError {
+					return CarthageError.taskError($0)
+			}
 		}
 		.then(SignalProducer<(), CarthageError>.empty)
 }
@@ -426,30 +475,42 @@ private func shouldBuildFrameworkType(_ frameworkType: FrameworkType?) -> Bool {
 	return frameworkType != nil
 }
 
-/// Determines whether the given scheme should be built automatically.
-private func shouldBuildScheme(_ buildArguments: BuildArguments, _ forPlatforms: Set<Platform>) -> SignalProducer<Bool, CarthageError> {
-	precondition(buildArguments.scheme != nil)
+/// Determines whether the given scheme contained int the `BuildSettings` should  be built automatically.
+private func shouldBuild(scheme: Scheme,
+						 withSettings settings: BuildSettings,
+						 forPlatforms platforms: Set<Platform>,
+						 shouldBuildForDistribution: Bool) -> SignalProducer<Bool, CarthageError> {
 
-	return BuildSettings.load(with: buildArguments)
-		.flatMap(.concat) { settings -> SignalProducer<FrameworkType?, CarthageError> in
-			let frameworkType = SignalProducer(result: settings.frameworkType)
+	let producer = SignalProducer<BuildSettings, CarthageError>(value: settings)
 
-			if forPlatforms.isEmpty {
-				return frameworkType
-					.flatMapError { _ in .empty }
-			} else {
-				return settings.buildSDKs
-					.filter { forPlatforms.contains($0.platform) }
-					.flatMap(.merge) { _ in frameworkType }
-					.flatMapError { _ in .empty }
-			}
+
+	let k = producer
+		.flatMap(.merge) {
+			SignalProducer
+			.zip($0.buildSDKs, SignalProducer(result: $0.frameworkType).flatMapError { _ in return .empty } )
+			.zip(with: SignalProducer<BuildSettings, CarthageError>(value: $0))
 		}
-		.filter(shouldBuildFrameworkType)
-		// If we find any framework target, we should indeed build this scheme.
-		.map { _ in true }
-		// Otherwise, nope.
-		.concat(value: false)
-		.take(first: 1)
+		.map { return ($0.0, $0.1, $1) }
+		.filter {
+			platforms.contains($0.0.platform)
+		}
+		.flatMap(.merge) { tuple -> SignalProducer<(SDK, FrameworkType?, BuildSettings), CarthageError> in
+			let (_, _, settings) = tuple
+			if shouldBuildForDistribution {
+					let shouldBuilForDistributionResult: Result<Bool, CarthageError> = settings
+						.shouldBuildForDistribution
+						.flatMapError { _ in .success(false) }
+
+					if !shouldBuilForDistributionResult.value! {
+						return SignalProducer(error: .notForDistribution(scheme: scheme))
+					}
+				}
+				return SignalProducer<(SDK, FrameworkType?, BuildSettings), CarthageError>(value: tuple)
+		}
+		.map { return $0.1 }
+		.map(shouldBuildFrameworkType)
+
+	return k
 }
 
 /// Aggregates all of the build settings sent on the given signal, associating
@@ -581,7 +642,7 @@ public func buildScheme( // swiftlint:disable:this function_body_length cyclomat
 	)
 
 	return BuildSettings.SDKsForScheme(scheme, inProject: project)
-		.flatMap(.concat) { sdk -> SignalProducer<SDK, CarthageError> in
+		.flatMap(.concat) { sdk -> SignalProducer<(BuildSettings, SDK), CarthageError> in
 			var argsForLoading = buildArgs
 			argsForLoading.sdk = sdk
 
@@ -593,14 +654,16 @@ public func buildScheme( // swiftlint:disable:this function_body_length cyclomat
 					// must add a User-Defined setting of ENABLE_BITCODE=NO.
 					return settings.bitcodeEnabled.value == true || ![.tvOS, .watchOS].contains(sdk)
 				}
-				.map { _ in sdk }
+				.map { settings in return (settings, sdk) }
 		}
-		.reduce(into: [:]) { (sdksByPlatform: inout [Platform: Set<SDK>], sdk: SDK) in
+		.reduce(into: [Platform: Set<SDK>]()) { sdksByPlatform, next in
+			let (_, sdk) = next
 			let platform = sdk.platform
 
 			if var sdks = sdksByPlatform[platform] {
 				sdks.insert(sdk)
 				sdksByPlatform.updateValue(sdks, forKey: platform)
+
 			} else {
 				sdksByPlatform[platform] = [sdk]
 			}
@@ -612,10 +675,6 @@ public func buildScheme( // swiftlint:disable:this function_body_length cyclomat
 
 			let values = sdksByPlatform.map { ($0, Array($1)) }
 			return SignalProducer(values)
-		}
-		.flatMap(.concat) { platform, sdks -> SignalProducer<(Platform, [SDK]), CarthageError> in
-			let filterResult = sdkFilter(sdks, scheme, options.configuration, project)
-			return SignalProducer(result: filterResult.map { (platform, $0) })
 		}
 		.filter { _, sdks in
 			return !sdks.isEmpty
@@ -678,11 +737,24 @@ public func buildScheme( // swiftlint:disable:this function_body_length cyclomat
 						}
 					}
 					.flatMapTaskEvents(.concat) { deviceSettings, simulatorSettings in
-						return mergeBuildProducts(
-							deviceBuildSettings: deviceSettings,
-							simulatorBuildSettings: simulatorSettings,
-							into: deviceSettings.productDestinationPath(in: folderURL)
-						)
+						if options.useXCFrameworks {
+							let frameworkURLs = (deviceSettings.wrapperURL.fanout(simulatorSettings.wrapperURL))
+								.map { [ $0, $1 ] }
+							let outputURL = deviceSettings
+								.xcFrameworkWrapperName
+								.map(folderURL.appendingPathComponent)
+
+							return SignalProducer(result: frameworkURLs.fanout(outputURL))
+								.flatMap(.merge, createXCFramework)
+								.then(SignalProducer(result: outputURL))
+						}
+						else {
+							return mergeBuildProducts(
+								deviceBuildSettings: deviceSettings,
+								simulatorBuildSettings: simulatorSettings,
+								into: deviceSettings.productDestinationPath(in: folderURL)
+							)
+						}
 					}
 
 			default:
@@ -690,6 +762,12 @@ public func buildScheme( // swiftlint:disable:this function_body_length cyclomat
 			}
 		}
 		.flatMapTaskEvents(.concat) { builtProductURL -> SignalProducer<URL, CarthageError> in
+
+			guard !options.useXCFrameworks else {
+
+				return SignalProducer<URL, CarthageError>(value: builtProductURL)
+			}
+
 			return UUIDsForFramework(builtProductURL)
 				// Only attempt to create debug info if there is at least
 				// one dSYM architecture UUID in the framework. This can
@@ -723,7 +801,10 @@ private func resolveSameTargetName(for settings: BuildSettings) -> SignalProduce
 
 /// Runs the build for a given sdk and build arguments, optionally performing a clean first
 // swiftlint:disable:next function_body_length
-private func build(sdk: SDK, with buildArgs: BuildArguments, in workingDirectoryURL: URL) -> SignalProducer<TaskEvent<BuildSettings>, CarthageError> {
+private func build(sdk: SDK,
+	with buildArgs: BuildArguments,
+	in workingDirectoryURL: URL
+) -> SignalProducer<TaskEvent<BuildSettings>, CarthageError> {
 	var argsForLoading = buildArgs
 	argsForLoading.sdk = sdk
 
@@ -905,9 +986,10 @@ public func buildInDirectory( // swiftlint:disable:this function_body_length
 		// multiple times.
 		buildableSchemesInDirectory(directoryURL,
 									withConfiguration: options.configuration,
-									forPlatforms: options.platforms
+									forPlatforms: options.platforms,
+									useXCFrameworks: options.useXCFrameworks
 			)
-			.flatMap(.concat) { (scheme: Scheme, project: ProjectLocator) -> SignalProducer<TaskEvent<URL>, CarthageError> in
+			.flatMap(.concat) { (scheme: Scheme, project: ProjectLocator, _: BuildSettings) -> SignalProducer<TaskEvent<URL>, CarthageError> in
 				let initialValue = (project, scheme)
 
 				let wrappedSDKFilter: SDKFilterCallback = { sdks, scheme, configuration, project in
@@ -1017,12 +1099,12 @@ private func stripBinary(_ binaryURL: URL, keepingArchitectures: [String]) -> Si
   // same framework.
   //
   // In a nutshell:
-  //  pid 1094 copyProduct(MyFrameworkframework.dSYM)
+  //  pid 1094 copyProduct(MyFramework.framework)
   //  pid 1094 stripArchitecture(armv7)
   //  pid 1094 stripArchitecture(arm64)
-  //  pid 1684 copyProduct(MyFramework.framework.dSYM)
+  //  pid 1684 copyProduct(MyFramework.framework)
   //  pid 1684 stripArchitecture(armv7)
-  //  pid 1916 copyProduct(MyFrameworkframework.dSYM)
+  //  pid 1916 copyProduct(MyFramework.framework)
   //  pid 1916 stripArchitecture(armv7)
   //  pid 1684 stripArchitecture(arm64)
   //  pid 1916 stripArchitecture(arm64)  <-- already stripped, so an error occurs
@@ -1030,8 +1112,20 @@ private func stripBinary(_ binaryURL: URL, keepingArchitectures: [String]) -> Si
   //  A shell task (/usr/bin/xcrun lipo -remove armv7 […] failed with exit code 1:
   //  fatal error: […]MyFramework.framework does not contain that architecture
   //
-  // So we copy it to /tmp, modify it there, and copy it back to thie original
+  // So we copy it to /tmp, modify it there, and copy it back to the original
   // location. Problem averted!
+  //
+  // Footnote: Turns out this works perfectly for _framework_s, but the dSYMs
+  // introduce a wrinkle: They are all copied to ($BUILT_PRODUCTS_DIR), regardless
+  // of where the frameworks go, so that whole lipo scenario still exists. After
+  // many overly-complex attemts to handle cross-process & cross-thread locking,
+  // I came up with a simplified solution.
+  //
+  // - Continue to do all the work in tmp
+  // - Check to see if the product in tmp is exactly the same as the destination
+  //   - If so, delete the temp file
+  //   - If not, overwrite the dest (this handles updates to an existing dSYM)
+  //
 
   let fileManager = FileManager.default.reactive
   
@@ -1053,14 +1147,17 @@ private func stripBinary(_ binaryURL: URL, keepingArchitectures: [String]) -> Si
   }
   
   return createTempDir
-    .flatMap(.merge) { temp in
-      copyItem(binaryURL, temp)
+    .flatMap(.merge) { tempDir in
+      copyItem(binaryURL, tempDir)
     }
-    .flatMap(.merge) { workspace in
-      strip(workspace, keepingArchitectures)
+    .flatMap(.merge) { tempFile in
+      strip(tempFile, keepingArchitectures)
     }
-    .flatMap(.merge) { workspace in
-      replace(binaryURL, workspace)
+    .filter { tempFile in
+      return !FileManager.default.contentsEqual(atPath: tempFile.path, andPath: binaryURL.path)
+    }
+    .flatMap(.merge) { tempFile in
+      replace(binaryURL, tempFile)
   }
 }
 
